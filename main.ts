@@ -8,21 +8,40 @@ import {
 	PluginSettingTab,
 	RequestUrlParam,
 	Setting,
-	htmlToMarkdown,
+	TAbstractFile,
+	TFile,
+	TFolder,
 	requestUrl,
-	sanitizeHTMLToDom,
 } from "obsidian";
+
+type SyncManifest = Record<string, Record<string, string>>;
+
+interface SyncedRepoEntry {
+	host: string;
+	projectPath: string;
+	lastSyncAt: number;
+}
+
+type SyncedRepos = Record<string, SyncedRepoEntry>;
 
 interface GitlabReadmeImportSettings {
 	gitlabUrl: string;
 	gitlabToken: string;
 	convertHtml: boolean;
+	syncFolder: string;
+	syncExtensions: string;
+	syncManifest: SyncManifest;
+	syncedRepos: SyncedRepos;
 }
 
 const DEFAULT_SETTINGS: GitlabReadmeImportSettings = {
 	gitlabUrl: "https://gitlab.com",
 	gitlabToken: "",
 	convertHtml: true,
+	syncFolder: "GitLab",
+	syncExtensions: ".md,.markdown,.mdown",
+	syncManifest: {},
+	syncedRepos: {},
 };
 
 interface ParsedRepo {
@@ -65,23 +84,63 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 
 		this.addSettingTab(new GitlabReadmeImportSettingTab(this.app, this));
 
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				void this.handleRename(file, oldPath);
+			}),
+		);
+
 		this.addCommand({
 			id: "import-gitlab-readme",
 			name: "Import GitLab README",
 			editorCallback: (editor: Editor, _view: MarkdownView) => {
-				new GitlabRepoModal(this.app, (repoUrl) => {
-					this.importReadme(repoUrl, editor);
+				new GitlabRepoModal(this.app, {
+					title: "Import GitLab README",
+					description:
+						"Paste a GitLab repository URL (e.g. https://gitlab.com/group/project). URLs pointing at a branch or file will also be accepted.",
+					buttonText: "Import",
+					onSubmit: (repoUrl) => {
+						this.importReadme(repoUrl, editor);
+					},
 				}).open();
+			},
+		});
+
+		this.addCommand({
+			id: "sync-gitlab-markdown",
+			name: "Sync GitLab repo markdown",
+			callback: () => {
+				new GitlabRepoModal(this.app, {
+					title: "Sync GitLab repo markdown",
+					description:
+						"Paste a GitLab repo URL. Every markdown file in the repo will be mirrored into your vault, preserving folder structure. Re-run to pull updates.",
+					buttonText: "Sync",
+					onSubmit: (repoUrl) => {
+						this.syncRepoMarkdown(repoUrl);
+					},
+				}).open();
+			},
+		});
+
+		this.addCommand({
+			id: "sync-all-gitlab-repos",
+			name: "Sync all GitLab repos",
+			callback: () => {
+				void this.syncAllRepos();
 			},
 		});
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData(),
-		);
+		const loaded = (await this.loadData()) ?? {};
+		this.settings = {
+			...DEFAULT_SETTINGS,
+			syncManifest: {},
+			syncedRepos: {},
+			...loaded,
+		};
+		if (!this.settings.syncManifest) this.settings.syncManifest = {};
+		if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
 	}
 
 	async saveSettings() {
@@ -271,6 +330,286 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		return /\.(md|mdown|markdown)$/i.test(filename);
 	}
 
+	async syncRepoMarkdown(repoUrl: string): Promise<void> {
+		const trimmed = (repoUrl ?? "").trim();
+		if (!trimmed) {
+			new Notice("Please enter a GitLab repository URL.");
+			return;
+		}
+
+		try {
+			const parsed = this.parseRepoUrl(trimmed);
+			const apiBase = this.buildApiBase(parsed.host);
+			const project = await this.fetchProject(apiBase, parsed.projectPath);
+			const ref = parsed.ref ?? project.default_branch;
+
+			const entries = await this.fetchTreeRecursive(
+				apiBase,
+				parsed.projectPath,
+				ref,
+			);
+			const extensions = this.parseExtensions(this.settings.syncExtensions);
+			const files = entries.filter(
+				(entry) =>
+					entry.type === "blob" &&
+					extensions.some((ext) =>
+						entry.path.toLowerCase().endsWith(ext),
+					),
+			);
+			if (files.length === 0) {
+				new Notice(
+					`No matching files found in ${parsed.projectPath}@${ref}.`,
+				);
+				return;
+			}
+
+			const baseFolder = this.normalizeFolder(this.settings.syncFolder);
+			const targetRoot = baseFolder
+				? `${baseFolder}/${parsed.projectPath}`
+				: parsed.projectPath;
+
+			const progress = new Notice(
+				`Syncing ${files.length} file(s) from ${parsed.projectPath}@${ref}\u2026`,
+				0,
+			);
+
+			const projectKey = this.projectKey(parsed.host, parsed.projectPath);
+			if (!this.settings.syncManifest) this.settings.syncManifest = {};
+			if (!this.settings.syncManifest[projectKey]) {
+				this.settings.syncManifest[projectKey] = {};
+			}
+			const projectManifest = this.settings.syncManifest[projectKey];
+
+			let written = 0;
+			let failed = 0;
+			let movedCount = 0;
+			for (const entry of files) {
+				try {
+					const content = await this.fetchRawFile(
+						apiBase,
+						parsed.projectPath,
+						ref,
+						entry.path,
+					);
+					const defaultPath = `${targetRoot}/${entry.path}`;
+					let targetPath = defaultPath;
+					const trackedPath = projectManifest[entry.path];
+					if (
+						trackedPath &&
+						trackedPath !== defaultPath &&
+						this.app.vault.getAbstractFileByPath(trackedPath) instanceof
+							TFile
+					) {
+						targetPath = trackedPath;
+						movedCount += 1;
+					}
+					await this.writeVaultFile(targetPath, content);
+					projectManifest[entry.path] = targetPath;
+					written += 1;
+					progress.setMessage(
+						`Syncing ${parsed.projectPath}\u2026 ${written}/${files.length}`,
+					);
+				} catch (err) {
+					failed += 1;
+					console.warn(`Failed to sync ${entry.path}`, err);
+				}
+			}
+			if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
+			this.settings.syncedRepos[projectKey] = {
+				host: parsed.host,
+				projectPath: parsed.projectPath,
+				lastSyncAt: Date.now(),
+			};
+			await this.saveSettings();
+			progress.hide();
+			const movedSuffix =
+				movedCount > 0
+					? ` (${movedCount} file(s) updated at user-moved locations)`
+					: "";
+			const failSuffix =
+				failed > 0 ? ` (${failed} failed \u2014 see console)` : "";
+			new Notice(
+				`Synced ${written} file(s) to ${targetRoot}${movedSuffix}${failSuffix}`,
+			);
+		} catch (error) {
+			console.error("GitLab markdown sync failed", error);
+			const message = error instanceof Error ? error.message : String(error);
+			new Notice(`Failed to sync GitLab markdown: ${message}`);
+		}
+	}
+
+	async syncAllRepos(): Promise<void> {
+		const repos = this.settings.syncedRepos ?? {};
+		const keys = Object.keys(repos);
+		if (keys.length === 0) {
+			new Notice(
+				"No synced GitLab repos yet. Run 'Sync GitLab repo markdown' at least once first.",
+			);
+			return;
+		}
+		new Notice(`Re-syncing ${keys.length} GitLab repo(s)\u2026`);
+		for (const key of keys) {
+			const entry = repos[key];
+			const url = `${entry.host.replace(/\/+$/, "")}/${entry.projectPath}`;
+			await this.syncRepoMarkdown(url);
+		}
+		new Notice(`Finished re-syncing ${keys.length} GitLab repo(s).`);
+	}
+
+	forgetSyncedRepo(projectKey: string): void {
+		if (this.settings.syncedRepos) {
+			delete this.settings.syncedRepos[projectKey];
+		}
+		if (this.settings.syncManifest) {
+			delete this.settings.syncManifest[projectKey];
+		}
+		void this.saveSettings();
+	}
+
+	private async fetchTreeRecursive(
+		apiBase: string,
+		projectPath: string,
+		ref: string,
+	): Promise<GitlabTreeEntry[]> {
+		const entries: GitlabTreeEntry[] = [];
+		let page = 1;
+		const maxPages = 100;
+		while (page > 0 && page <= maxPages) {
+			const url = `${apiBase}/projects/${encodeURIComponent(
+				projectPath,
+			)}/repository/tree?ref=${encodeURIComponent(
+				ref,
+			)}&recursive=true&per_page=100&page=${page}`;
+			const response = await this.request({ url });
+			if (response.status < 200 || response.status >= 300) {
+				throw new Error(
+					`GitLab tree request failed with status ${response.status}.`,
+				);
+			}
+			const pageEntries = response.json as GitlabTreeEntry[];
+			if (!Array.isArray(pageEntries)) break;
+			entries.push(...pageEntries);
+			const next = this.getHeader(response.headers, "x-next-page");
+			if (!next) break;
+			const parsedNext = parseInt(next, 10);
+			if (!parsedNext || parsedNext <= page) break;
+			page = parsedNext;
+		}
+		return entries;
+	}
+
+	private async fetchRawFile(
+		apiBase: string,
+		projectPath: string,
+		ref: string,
+		filePath: string,
+	): Promise<string> {
+		const fileUrl = `${apiBase}/projects/${encodeURIComponent(
+			projectPath,
+		)}/repository/files/${encodeURIComponent(
+			filePath,
+		)}/raw?ref=${encodeURIComponent(ref)}`;
+		const response = await this.request({ url: fileUrl });
+		if (response.status < 200 || response.status >= 300) {
+			throw new Error(
+				`Failed to fetch ${filePath} (status ${response.status}).`,
+			);
+		}
+		return response.text;
+	}
+
+	private parseExtensions(raw: string): string[] {
+		return (raw ?? "")
+			.split(",")
+			.map((s) => s.trim().toLowerCase())
+			.filter((s) => s.length > 0)
+			.map((s) => (s.startsWith(".") ? s : `.${s}`));
+	}
+
+	private normalizeFolder(folder: string): string {
+		return (folder ?? "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+	}
+
+	private getHeader(
+		headers: Record<string, string> | undefined,
+		name: string,
+	): string | null {
+		if (!headers) return null;
+		const lower = name.toLowerCase();
+		for (const key of Object.keys(headers)) {
+			if (key.toLowerCase() === lower) {
+				const value = headers[key];
+				return value && value.length > 0 ? value : null;
+			}
+		}
+		return null;
+	}
+
+	private async writeVaultFile(
+		path: string,
+		content: string,
+	): Promise<void> {
+		const normalized = path.replace(/^\/+/, "");
+		const lastSlash = normalized.lastIndexOf("/");
+		if (lastSlash > 0) {
+			await this.ensureFolder(normalized.substring(0, lastSlash));
+		}
+		const existing = this.app.vault.getAbstractFileByPath(normalized);
+		if (existing instanceof TFile) {
+			await this.app.vault.modify(existing, content);
+		} else {
+			await this.app.vault.create(normalized, content);
+		}
+	}
+
+	private projectKey(host: string, projectPath: string): string {
+		return `${host.replace(/\/+$/, "")}::${projectPath}`;
+	}
+
+	private async handleRename(
+		file: TAbstractFile,
+		oldPath: string,
+	): Promise<void> {
+		if (!this.settings?.syncManifest) return;
+		const newPath = file.path;
+		if (oldPath === newPath) return;
+
+		const isFolder = file instanceof TFolder;
+		const prefix = oldPath + "/";
+		let changed = false;
+
+		for (const projectKey of Object.keys(this.settings.syncManifest)) {
+			const manifest = this.settings.syncManifest[projectKey];
+			for (const originalPath of Object.keys(manifest)) {
+				const current = manifest[originalPath];
+				if (current === oldPath) {
+					manifest[originalPath] = newPath;
+					changed = true;
+				} else if (isFolder && current.startsWith(prefix)) {
+					manifest[originalPath] =
+						newPath + current.substring(oldPath.length);
+					changed = true;
+				}
+			}
+		}
+
+		if (changed) await this.saveSettings();
+	}
+
+	private async ensureFolder(path: string): Promise<void> {
+		const parts = path.split("/").filter(Boolean);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (this.app.vault.getAbstractFileByPath(current)) continue;
+			try {
+				await this.app.vault.createFolder(current);
+			} catch {
+				// concurrent creation is fine
+			}
+		}
+	}
+
 	resolveRelativeUrls(
 		content: string,
 		host: string,
@@ -325,30 +664,29 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		return result;
 	}
 
-	// Expose helpers for potential future use / testing without adding deps.
-	convertInlineHtmlToMarkdown(content: string): string {
-		const container = document.createElement("div");
-		container.appendChild(sanitizeHTMLToDom(content));
-		return htmlToMarkdown(container.innerHTML);
-	}
+}
+
+interface GitlabRepoModalOptions {
+	title: string;
+	description: string;
+	buttonText: string;
+	onSubmit: (result: string) => void;
 }
 
 class GitlabRepoModal extends Modal {
 	private result = "";
-	private readonly onSubmit: (result: string) => void;
+	private readonly opts: GitlabRepoModalOptions;
 
-	constructor(app: App, onSubmit: (result: string) => void) {
+	constructor(app: App, opts: GitlabRepoModalOptions) {
 		super(app);
-		this.onSubmit = onSubmit;
+		this.opts = opts;
 	}
 
 	onOpen() {
 		const { contentEl } = this;
 
-		contentEl.createEl("h2", { text: "Import GitLab README" });
-		contentEl.createEl("p", {
-			text: "Paste a GitLab repository URL (e.g. https://gitlab.com/group/project). URLs pointing at a branch or file will also be accepted.",
-		});
+		contentEl.createEl("h2", { text: this.opts.title });
+		contentEl.createEl("p", { text: this.opts.description });
 
 		new Setting(contentEl)
 			.setName("Repository URL or path")
@@ -368,7 +706,7 @@ class GitlabRepoModal extends Modal {
 
 		new Setting(contentEl).addButton((btn) =>
 			btn
-				.setButtonText("Import")
+				.setButtonText(this.opts.buttonText)
 				.setCta()
 				.onClick(() => this.submit()),
 		);
@@ -376,7 +714,7 @@ class GitlabRepoModal extends Modal {
 
 	private submit() {
 		this.close();
-		this.onSubmit(this.result);
+		this.opts.onSubmit(this.result);
 	}
 
 	onClose() {
@@ -415,6 +753,16 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 		step3.appendText(") and click ");
 		step3.createEl("strong", { text: "Import" });
 		step3.appendText(". The README is inserted at the cursor.");
+
+		const syncPara = howTo.createEl("p");
+		syncPara.createEl("strong", { text: "Sync every markdown file: " });
+		syncPara.appendText("run ");
+		syncPara.createEl("strong", { text: "Sync GitLab repo markdown" });
+		syncPara.appendText(" instead. All ");
+		syncPara.createEl("code", { text: ".md" });
+		syncPara.appendText(
+			" files in the repo are written into the vault under the folder configured below, preserving the repo's directory structure. Re-run any time to pull updates.",
+		);
 
 		const privateNote = howTo.createEl("p");
 		privateNote.createEl("strong", { text: "Private repos: " });
@@ -471,6 +819,93 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		containerEl.createEl("h3", { text: "Sync GitLab repo markdown" });
+
+		new Setting(containerEl)
+			.setName("Sync destination folder")
+			.setDesc(
+				"Vault folder where synced repos are mirrored. Each repo is placed under <folder>/<group>/<project>/\u2026 . Leave blank to mirror at the vault root.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("GitLab")
+					.setValue(this.plugin.settings.syncFolder)
+					.onChange(async (value) => {
+						this.plugin.settings.syncFolder = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("File extensions to sync")
+			.setDesc(
+				"Comma-separated list of file extensions to include when syncing (case-insensitive).",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder(".md,.markdown,.mdown")
+					.setValue(this.plugin.settings.syncExtensions)
+					.onChange(async (value) => {
+						this.plugin.settings.syncExtensions = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		containerEl.createEl("h4", { text: "Synced repos" });
+		const syncedRepos = this.plugin.settings.syncedRepos ?? {};
+		const repoKeys = Object.keys(syncedRepos).sort();
+		if (repoKeys.length === 0) {
+			const empty = containerEl.createEl("p");
+			empty.appendText(
+				"No repos synced yet. Run \u201CSync GitLab repo markdown\u201D to add one. Once you've synced at least one repo, \u201CSync all GitLab repos\u201D will refresh them all at once.",
+			);
+		} else {
+			for (const key of repoKeys) {
+				const entry = syncedRepos[key];
+				const when = entry.lastSyncAt
+					? new Date(entry.lastSyncAt).toLocaleString()
+					: "never";
+				new Setting(containerEl)
+					.setName(entry.projectPath)
+					.setDesc(`${entry.host} \u2014 last synced ${when}`)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Sync now")
+							.onClick(async () => {
+								const url = `${entry.host.replace(
+									/\/+$/,
+									"",
+								)}/${entry.projectPath}`;
+								await this.plugin.syncRepoMarkdown(url);
+								this.display();
+							}),
+					)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Forget")
+							.setWarning()
+							.onClick(() => {
+								this.plugin.forgetSyncedRepo(key);
+								this.display();
+							}),
+					);
+			}
+			new Setting(containerEl)
+				.setName("Sync all now")
+				.setDesc(
+					"Re-sync every remembered repo. Same as the \u201CSync all GitLab repos\u201D command.",
+				)
+				.addButton((btn) =>
+					btn
+						.setButtonText("Sync all")
+						.setCta()
+						.onClick(async () => {
+							await this.plugin.syncAllRepos();
+							this.display();
+						}),
+				);
+		}
 
 		containerEl.createEl("h3", { text: "More information" });
 		containerEl.createEl("a", {
