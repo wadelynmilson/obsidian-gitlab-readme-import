@@ -2,3 +2,33 @@
 This CSS file will be included with your plugin, and
 available in the app when your plugin is enabled.
 */
+
+.gitlab-readme-import-howto {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	padding: 0.5em 1em;
+	margin-bottom: 1.25em;
+	background-color: var(--background-secondary);
+}
+
+.gitlab-readme-import-howto h3 {
+	margin-top: 0.25em;
+}
+
+.gitlab-readme-import-howto ol {
+	margin: 0.25em 0 0.5em 1.25em;
+	padding: 0;
+}
+
+.gitlab-readme-import-howto li {
+	margin: 0.15em 0;
+}
+
+.gitlab-readme-import-howto kbd {
+	font-family: var(--font-monospace);
+	font-size: 0.85em;
+	padding: 0 4px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 3px;
+	background-color: var(--background-primary);
+}
