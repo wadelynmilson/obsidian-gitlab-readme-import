@@ -8,11 +8,15 @@ import {
 	PluginSettingTab,
 	RequestUrlParam,
 	Setting,
+	TAbstractFile,
 	TFile,
+	TFolder,
 	htmlToMarkdown,
 	requestUrl,
 	sanitizeHTMLToDom,
 } from "obsidian";
+
+type SyncManifest = Record<string, Record<string, string>>;
 
 interface GitlabReadmeImportSettings {
 	gitlabUrl: string;
@@ -20,6 +24,7 @@ interface GitlabReadmeImportSettings {
 	convertHtml: boolean;
 	syncFolder: string;
 	syncExtensions: string;
+	syncManifest: SyncManifest;
 }
 
 const DEFAULT_SETTINGS: GitlabReadmeImportSettings = {
@@ -28,6 +33,7 @@ const DEFAULT_SETTINGS: GitlabReadmeImportSettings = {
 	convertHtml: true,
 	syncFolder: "GitLab",
 	syncExtensions: ".md,.markdown,.mdown",
+	syncManifest: {},
 };
 
 interface ParsedRepo {
@@ -70,6 +76,12 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 
 		this.addSettingTab(new GitlabReadmeImportSettingTab(this.app, this));
 
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				void this.handleRename(file, oldPath);
+			}),
+		);
+
 		this.addCommand({
 			id: "import-gitlab-readme",
 			name: "Import GitLab README",
@@ -104,11 +116,13 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			await this.loadData(),
-		);
+		const loaded = (await this.loadData()) ?? {};
+		this.settings = {
+			...DEFAULT_SETTINGS,
+			syncManifest: {},
+			...loaded,
+		};
+		if (!this.settings.syncManifest) this.settings.syncManifest = {};
 	}
 
 	async saveSettings() {
@@ -341,8 +355,16 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 				0,
 			);
 
+			const projectKey = this.projectKey(parsed.host, parsed.projectPath);
+			if (!this.settings.syncManifest) this.settings.syncManifest = {};
+			if (!this.settings.syncManifest[projectKey]) {
+				this.settings.syncManifest[projectKey] = {};
+			}
+			const projectManifest = this.settings.syncManifest[projectKey];
+
 			let written = 0;
 			let failed = 0;
+			let movedCount = 0;
 			for (const entry of files) {
 				try {
 					const content = await this.fetchRawFile(
@@ -351,8 +373,20 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 						ref,
 						entry.path,
 					);
-					const vaultPath = `${targetRoot}/${entry.path}`;
-					await this.writeVaultFile(vaultPath, content);
+					const defaultPath = `${targetRoot}/${entry.path}`;
+					let targetPath = defaultPath;
+					const trackedPath = projectManifest[entry.path];
+					if (
+						trackedPath &&
+						trackedPath !== defaultPath &&
+						this.app.vault.getAbstractFileByPath(trackedPath) instanceof
+							TFile
+					) {
+						targetPath = trackedPath;
+						movedCount += 1;
+					}
+					await this.writeVaultFile(targetPath, content);
+					projectManifest[entry.path] = targetPath;
 					written += 1;
 					progress.setMessage(
 						`Syncing ${parsed.projectPath}\u2026 ${written}/${files.length}`,
@@ -362,9 +396,17 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 					console.warn(`Failed to sync ${entry.path}`, err);
 				}
 			}
+			await this.saveSettings();
 			progress.hide();
-			const suffix = failed > 0 ? ` (${failed} failed \u2014 see console)` : "";
-			new Notice(`Synced ${written} file(s) to ${targetRoot}/${suffix}`);
+			const movedSuffix =
+				movedCount > 0
+					? ` (${movedCount} file(s) updated at user-moved locations)`
+					: "";
+			const failSuffix =
+				failed > 0 ? ` (${failed} failed \u2014 see console)` : "";
+			new Notice(
+				`Synced ${written} file(s) to ${targetRoot}/${movedSuffix}${failSuffix}`,
+			);
 		} catch (error) {
 			console.error("GitLab markdown sync failed", error);
 			const message = error instanceof Error ? error.message : String(error);
@@ -466,6 +508,40 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		} else {
 			await this.app.vault.create(normalized, content);
 		}
+	}
+
+	private projectKey(host: string, projectPath: string): string {
+		return `${host.replace(/\/+$/, "")}::${projectPath}`;
+	}
+
+	private async handleRename(
+		file: TAbstractFile,
+		oldPath: string,
+	): Promise<void> {
+		if (!this.settings?.syncManifest) return;
+		const newPath = file.path;
+		if (oldPath === newPath) return;
+
+		const isFolder = file instanceof TFolder;
+		const prefix = oldPath + "/";
+		let changed = false;
+
+		for (const projectKey of Object.keys(this.settings.syncManifest)) {
+			const manifest = this.settings.syncManifest[projectKey];
+			for (const originalPath of Object.keys(manifest)) {
+				const current = manifest[originalPath];
+				if (current === oldPath) {
+					manifest[originalPath] = newPath;
+					changed = true;
+				} else if (isFolder && current.startsWith(prefix)) {
+					manifest[originalPath] =
+						newPath + current.substring(oldPath.length);
+					changed = true;
+				}
+			}
+		}
+
+		if (changed) await this.saveSettings();
 	}
 
 	private async ensureFolder(path: string): Promise<void> {
