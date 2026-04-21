@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-gitlab-readme-import",
+	"name": "Import GitLab Readme",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Fetches and integrates GitLab README files into personal notes.",
+	"author": "wadelynmilson",
+	"authorUrl": "https://github.com/wadelynmilson",
+	"isDesktopOnly": false
+}
