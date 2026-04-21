@@ -18,6 +18,14 @@ import {
 
 type SyncManifest = Record<string, Record<string, string>>;
 
+interface SyncedRepoEntry {
+	host: string;
+	projectPath: string;
+	lastSyncAt: number;
+}
+
+type SyncedRepos = Record<string, SyncedRepoEntry>;
+
 interface GitlabReadmeImportSettings {
 	gitlabUrl: string;
 	gitlabToken: string;
@@ -25,6 +33,7 @@ interface GitlabReadmeImportSettings {
 	syncFolder: string;
 	syncExtensions: string;
 	syncManifest: SyncManifest;
+	syncedRepos: SyncedRepos;
 }
 
 const DEFAULT_SETTINGS: GitlabReadmeImportSettings = {
@@ -34,6 +43,7 @@ const DEFAULT_SETTINGS: GitlabReadmeImportSettings = {
 	syncFolder: "GitLab",
 	syncExtensions: ".md,.markdown,.mdown",
 	syncManifest: {},
+	syncedRepos: {},
 };
 
 interface ParsedRepo {
@@ -113,6 +123,14 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 				}).open();
 			},
 		});
+
+		this.addCommand({
+			id: "sync-all-gitlab-repos",
+			name: "Sync all GitLab repos",
+			callback: () => {
+				void this.syncAllRepos();
+			},
+		});
 	}
 
 	async loadSettings() {
@@ -120,9 +138,11 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		this.settings = {
 			...DEFAULT_SETTINGS,
 			syncManifest: {},
+			syncedRepos: {},
 			...loaded,
 		};
 		if (!this.settings.syncManifest) this.settings.syncManifest = {};
+		if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
 	}
 
 	async saveSettings() {
@@ -396,6 +416,12 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 					console.warn(`Failed to sync ${entry.path}`, err);
 				}
 			}
+			if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
+			this.settings.syncedRepos[projectKey] = {
+				host: parsed.host,
+				projectPath: parsed.projectPath,
+				lastSyncAt: Date.now(),
+			};
 			await this.saveSettings();
 			progress.hide();
 			const movedSuffix =
@@ -412,6 +438,34 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 			const message = error instanceof Error ? error.message : String(error);
 			new Notice(`Failed to sync GitLab markdown: ${message}`);
 		}
+	}
+
+	async syncAllRepos(): Promise<void> {
+		const repos = this.settings.syncedRepos ?? {};
+		const keys = Object.keys(repos);
+		if (keys.length === 0) {
+			new Notice(
+				"No synced GitLab repos yet. Run 'Sync GitLab repo markdown' at least once first.",
+			);
+			return;
+		}
+		new Notice(`Re-syncing ${keys.length} GitLab repo(s)\u2026`);
+		for (const key of keys) {
+			const entry = repos[key];
+			const url = `${entry.host.replace(/\/+$/, "")}/${entry.projectPath}`;
+			await this.syncRepoMarkdown(url);
+		}
+		new Notice(`Finished re-syncing ${keys.length} GitLab repo(s).`);
+	}
+
+	forgetSyncedRepo(projectKey: string): void {
+		if (this.settings.syncedRepos) {
+			delete this.settings.syncedRepos[projectKey];
+		}
+		if (this.settings.syncManifest) {
+			delete this.settings.syncManifest[projectKey];
+		}
+		void this.saveSettings();
 	}
 
 	private async fetchTreeRecursive(
@@ -805,6 +859,61 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		containerEl.createEl("h4", { text: "Synced repos" });
+		const syncedRepos = this.plugin.settings.syncedRepos ?? {};
+		const repoKeys = Object.keys(syncedRepos).sort();
+		if (repoKeys.length === 0) {
+			const empty = containerEl.createEl("p");
+			empty.appendText(
+				"No repos synced yet. Run \u201CSync GitLab repo markdown\u201D to add one. Once you've synced at least one repo, \u201CSync all GitLab repos\u201D will refresh them all at once.",
+			);
+		} else {
+			for (const key of repoKeys) {
+				const entry = syncedRepos[key];
+				const when = entry.lastSyncAt
+					? new Date(entry.lastSyncAt).toLocaleString()
+					: "never";
+				new Setting(containerEl)
+					.setName(entry.projectPath)
+					.setDesc(`${entry.host} \u2014 last synced ${when}`)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Sync now")
+							.onClick(async () => {
+								const url = `${entry.host.replace(
+									/\/+$/,
+									"",
+								)}/${entry.projectPath}`;
+								await this.plugin.syncRepoMarkdown(url);
+								this.display();
+							}),
+					)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Forget")
+							.setWarning()
+							.onClick(() => {
+								this.plugin.forgetSyncedRepo(key);
+								this.display();
+							}),
+					);
+			}
+			new Setting(containerEl)
+				.setName("Sync all now")
+				.setDesc(
+					"Re-sync every remembered repo. Same as the \u201CSync all GitLab repos\u201D command.",
+				)
+				.addButton((btn) =>
+					btn
+						.setButtonText("Sync all")
+						.setCta()
+						.onClick(async () => {
+							await this.plugin.syncAllRepos();
+							this.display();
+						}),
+				);
+		}
 
 		containerEl.createEl("h3", { text: "More information" });
 		containerEl.createEl("a", {
