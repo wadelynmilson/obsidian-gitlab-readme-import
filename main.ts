@@ -19,6 +19,7 @@ type SyncManifest = Record<string, Record<string, string>>;
 interface SyncedRepoEntry {
 	host: string;
 	projectPath: string;
+	ref: string | null;
 	lastSyncAt: number;
 }
 
@@ -418,6 +419,7 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 			this.settings.syncedRepos[projectKey] = {
 				host: parsed.host,
 				projectPath: parsed.projectPath,
+				ref: parsed.ref,
 				lastSyncAt: Date.now(),
 			};
 			await this.saveSettings();
@@ -450,10 +452,14 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		new Notice(`Re-syncing ${keys.length} GitLab repo(s)\u2026`);
 		for (const key of keys) {
 			const entry = repos[key];
-			const url = `${entry.host.replace(/\/+$/, "")}/${entry.projectPath}`;
-			await this.syncRepoMarkdown(url);
+			await this.syncRepoMarkdown(this.repoUrlFromEntry(entry));
 		}
 		new Notice(`Finished re-syncing ${keys.length} GitLab repo(s).`);
+	}
+
+	repoUrlFromEntry(entry: SyncedRepoEntry): string {
+		const base = `${entry.host.replace(/\/+$/, "")}/${entry.projectPath}`;
+		return entry.ref ? `${base}/-/tree/${entry.ref}` : base;
 	}
 
 	forgetSyncedRepo(projectKey: string): void {
@@ -873,11 +879,9 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 						btn
 							.setButtonText("Sync now")
 							.onClick(async () => {
-								const url = `${entry.host.replace(
-									/\/+$/,
-									"",
-								)}/${entry.projectPath}`;
-								await this.plugin.syncRepoMarkdown(url);
+								await this.plugin.syncRepoMarkdown(
+									this.plugin.repoUrlFromEntry(entry),
+								);
 								this.display();
 							}),
 					)
