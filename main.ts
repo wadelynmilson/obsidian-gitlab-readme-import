@@ -398,10 +398,39 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h2", { text: "GitLab README Import" });
 
+		const howTo = containerEl.createDiv({ cls: "gitlab-readme-import-howto" });
+		howTo.createEl("h3", { text: "How to use" });
+		const ol = howTo.createEl("ol");
+		const step1 = ol.createEl("li");
+		step1.appendText("Open or create a note.");
+		const step2 = ol.createEl("li");
+		step2.appendText("Open the command palette (");
+		step2.createEl("kbd", { text: "Ctrl/Cmd+P" });
+		step2.appendText(") and run ");
+		step2.createEl("strong", { text: "Import GitLab README" });
+		step2.appendText(".");
+		const step3 = ol.createEl("li");
+		step3.appendText("Paste a repository URL (e.g. ");
+		step3.createEl("code", { text: "https://gitlab.com/group/project" });
+		step3.appendText(") and click ");
+		step3.createEl("strong", { text: "Import" });
+		step3.appendText(". The README is inserted at the cursor.");
+
+		const privateNote = howTo.createEl("p");
+		privateNote.createEl("strong", { text: "Private repos: " });
+		privateNote.appendText("set \u201CPersonal access token\u201D below. Create one at ");
+		privateNote.createEl("a", {
+			text: "gitlab.com/-/user_settings/personal_access_tokens",
+			href: "https://gitlab.com/-/user_settings/personal_access_tokens",
+		});
+		privateNote.appendText(" with the ");
+		privateNote.createEl("code", { text: "read_api" });
+		privateNote.appendText(" scope.");
+
 		new Setting(containerEl)
 			.setName("GitLab instance URL")
 			.setDesc(
-				"Base URL of your GitLab instance. Use the public gitlab.com or a self-hosted URL such as https://gitlab.example.com.",
+				"Root URL of your GitLab host only \u2014 e.g. https://gitlab.com or https://gitlab.example.com. Do NOT include a group or project path here.",
 			)
 			.addText((text) =>
 				text
