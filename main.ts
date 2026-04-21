@@ -11,9 +11,7 @@ import {
 	TAbstractFile,
 	TFile,
 	TFolder,
-	htmlToMarkdown,
 	requestUrl,
-	sanitizeHTMLToDom,
 } from "obsidian";
 
 type SyncManifest = Record<string, Record<string, string>>;
@@ -666,12 +664,6 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		return result;
 	}
 
-	// Expose helpers for potential future use / testing without adding deps.
-	convertInlineHtmlToMarkdown(content: string): string {
-		const container = document.createElement("div");
-		container.appendChild(sanitizeHTMLToDom(content));
-		return htmlToMarkdown(container.innerHTML);
-	}
 }
 
 interface GitlabRepoModalOptions {
