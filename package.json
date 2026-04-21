@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-gitlab-readme-import",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Obsidian plugin that imports README files from GitLab repositories (gitlab.com and self-hosted).",
 	"main": "main.js",
 	"scripts": {

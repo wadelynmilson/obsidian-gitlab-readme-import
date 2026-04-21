@@ -20,6 +20,7 @@ interface SyncedRepoEntry {
 	host: string;
 	projectPath: string;
 	ref: string | null;
+	destinationFolder?: string;
 	lastSyncAt: number;
 }
 
@@ -100,8 +101,8 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 					description:
 						"Paste a GitLab repository URL (e.g. https://gitlab.com/group/project). URLs pointing at a branch or file will also be accepted.",
 					buttonText: "Import",
-					onSubmit: (repoUrl) => {
-						this.importReadme(repoUrl, editor);
+					onSubmit: ({ url }) => {
+						this.importReadme(url, editor);
 					},
 				}).open();
 			},
@@ -116,8 +117,9 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 					description:
 						"Paste a GitLab repo URL. Every markdown file in the repo will be mirrored into your vault, preserving folder structure. Re-run to pull updates.",
 					buttonText: "Sync",
-					onSubmit: (repoUrl) => {
-						this.syncRepoMarkdown(repoUrl);
+					includeDestination: true,
+					onSubmit: ({ url, destinationFolder }) => {
+						void this.syncRepoMarkdown(url, { destinationFolder });
 					},
 				}).open();
 			},
@@ -331,7 +333,10 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 		return /\.(md|mdown|markdown)$/i.test(filename);
 	}
 
-	async syncRepoMarkdown(repoUrl: string): Promise<void> {
+	async syncRepoMarkdown(
+		repoUrl: string,
+		options: { destinationFolder?: string } = {},
+	): Promise<void> {
 		const trimmed = (repoUrl ?? "").trim();
 		if (!trimmed) {
 			new Notice("Please enter a GitLab repository URL.");
@@ -364,9 +369,26 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 				return;
 			}
 
-			const baseFolder = this.normalizeFolder(this.settings.syncFolder);
-			const targetRoot = baseFolder
-				? `${baseFolder}/${parsed.projectPath}`
+			const projectKey = this.projectKey(parsed.host, parsed.projectPath);
+			if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
+			const priorEntry = this.settings.syncedRepos[projectKey];
+			const priorDestination = priorEntry?.destinationFolder ?? "";
+			const nextDestinationRaw =
+				options.destinationFolder !== undefined
+					? options.destinationFolder
+					: priorDestination;
+			const nextDestination = nextDestinationRaw.trim();
+			const destinationChanged =
+				options.destinationFolder !== undefined &&
+				nextDestination !== priorDestination.trim();
+
+			const effectiveRoot =
+				this.normalizeFolder(nextDestination) ||
+				this.normalizeFolder(this.settings.syncFolder);
+			const targetRoot = effectiveRoot
+				? nextDestination
+					? effectiveRoot
+					: `${effectiveRoot}/${parsed.projectPath}`
 				: parsed.projectPath;
 
 			const progress = new Notice(
@@ -374,9 +396,10 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 				0,
 			);
 
-			const projectKey = this.projectKey(parsed.host, parsed.projectPath);
 			if (!this.settings.syncManifest) this.settings.syncManifest = {};
-			if (!this.settings.syncManifest[projectKey]) {
+			if (destinationChanged) {
+				this.settings.syncManifest[projectKey] = {};
+			} else if (!this.settings.syncManifest[projectKey]) {
 				this.settings.syncManifest[projectKey] = {};
 			}
 			const projectManifest = this.settings.syncManifest[projectKey];
@@ -415,11 +438,11 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 					console.warn(`Failed to sync ${entry.path}`, err);
 				}
 			}
-			if (!this.settings.syncedRepos) this.settings.syncedRepos = {};
 			this.settings.syncedRepos[projectKey] = {
 				host: parsed.host,
 				projectPath: parsed.projectPath,
 				ref: parsed.ref,
+				destinationFolder: nextDestination || undefined,
 				lastSyncAt: Date.now(),
 			};
 			await this.saveSettings();
@@ -672,20 +695,32 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 
 }
 
+interface GitlabRepoModalResult {
+	url: string;
+	destinationFolder?: string;
+}
+
 interface GitlabRepoModalOptions {
 	title: string;
 	description: string;
 	buttonText: string;
-	onSubmit: (result: string) => void;
+	initialUrl?: string;
+	lockUrl?: boolean;
+	includeDestination?: boolean;
+	initialDestination?: string;
+	onSubmit: (result: GitlabRepoModalResult) => void;
 }
 
 class GitlabRepoModal extends Modal {
-	private result = "";
+	private url = "";
+	private destination = "";
 	private readonly opts: GitlabRepoModalOptions;
 
 	constructor(app: App, opts: GitlabRepoModalOptions) {
 		super(app);
 		this.opts = opts;
+		this.url = opts.initialUrl ?? "";
+		this.destination = opts.initialDestination ?? "";
 	}
 
 	onOpen() {
@@ -697,11 +732,15 @@ class GitlabRepoModal extends Modal {
 		new Setting(contentEl)
 			.setName("Repository URL or path")
 			.addText((text) => {
-				text.setPlaceholder("https://gitlab.com/group/project").onChange(
-					(value) => {
-						this.result = value;
-					},
-				);
+				text
+					.setPlaceholder("https://gitlab.com/group/project")
+					.setValue(this.url)
+					.onChange((value) => {
+						this.url = value;
+					});
+				if (this.opts.lockUrl) {
+					text.inputEl.readOnly = true;
+				}
 				text.inputEl.addEventListener("keydown", (event) => {
 					if (event.key === "Enter") {
 						event.preventDefault();
@@ -709,6 +748,28 @@ class GitlabRepoModal extends Modal {
 					}
 				});
 			});
+
+		if (this.opts.includeDestination) {
+			new Setting(contentEl)
+				.setName("Destination folder (optional)")
+				.setDesc(
+					"Vault folder for this repo. Leave blank to use the global sync folder. Files land at <destination>/<path-in-repo>.",
+				)
+				.addText((text) => {
+					text
+						.setPlaceholder("e.g. Code References/battery-swap")
+						.setValue(this.destination)
+						.onChange((value) => {
+							this.destination = value;
+						});
+					text.inputEl.addEventListener("keydown", (event) => {
+						if (event.key === "Enter") {
+							event.preventDefault();
+							this.submit();
+						}
+					});
+				});
+		}
 
 		new Setting(contentEl).addButton((btn) =>
 			btn
@@ -720,7 +781,11 @@ class GitlabRepoModal extends Modal {
 
 	private submit() {
 		this.close();
-		this.opts.onSubmit(this.result);
+		const result: GitlabRepoModalResult = { url: this.url };
+		if (this.opts.includeDestination) {
+			result.destinationFolder = this.destination;
+		}
+		this.opts.onSubmit(result);
 	}
 
 	onClose() {
@@ -859,12 +924,39 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 			);
 
 		containerEl.createEl("h4", { text: "Synced repos" });
+
+		new Setting(containerEl)
+			.setName("Add repo")
+			.setDesc(
+				"Sync a new GitLab repo and remember it. Optionally pick a custom destination folder for this repo.",
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Add repo")
+					.setCta()
+					.onClick(() => {
+						new GitlabRepoModal(this.app, {
+							title: "Sync a new GitLab repo",
+							description:
+								"Paste a GitLab repo URL. Every markdown file in the repo will be mirrored into your vault. Destination folder is optional \u2014 leave blank to use the global sync folder.",
+							buttonText: "Sync",
+							includeDestination: true,
+							onSubmit: async ({ url, destinationFolder }) => {
+								await this.plugin.syncRepoMarkdown(url, {
+									destinationFolder,
+								});
+								this.display();
+							},
+						}).open();
+					}),
+			);
+
 		const syncedRepos = this.plugin.settings.syncedRepos ?? {};
 		const repoKeys = Object.keys(syncedRepos).sort();
 		if (repoKeys.length === 0) {
 			const empty = containerEl.createEl("p");
 			empty.appendText(
-				"No repos synced yet. Run \u201CSync GitLab repo markdown\u201D to add one. Once you've synced at least one repo, \u201CSync all GitLab repos\u201D will refresh them all at once.",
+				"No repos synced yet. Click \u201CAdd repo\u201D above or run the \u201CSync GitLab repo markdown\u201D command. Once you've synced at least one repo, \u201CSync all GitLab repos\u201D will refresh them all at once.",
 			);
 		} else {
 			for (const key of repoKeys) {
@@ -872,9 +964,19 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 				const when = entry.lastSyncAt
 					? new Date(entry.lastSyncAt).toLocaleString()
 					: "never";
+				const destination = entry.destinationFolder
+					? `\u2192 ${entry.destinationFolder}`
+					: "";
+				const desc = [
+					entry.host,
+					destination,
+					`last synced ${when}`,
+				]
+					.filter((s) => s.length > 0)
+					.join(" \u2014 ");
 				new Setting(containerEl)
 					.setName(entry.projectPath)
-					.setDesc(`${entry.host} \u2014 last synced ${when}`)
+					.setDesc(desc)
 					.addButton((btn) =>
 						btn
 							.setButtonText("Sync now")
@@ -883,6 +985,28 @@ class GitlabReadmeImportSettingTab extends PluginSettingTab {
 									this.plugin.repoUrlFromEntry(entry),
 								);
 								this.display();
+							}),
+					)
+					.addButton((btn) =>
+						btn
+							.setButtonText("Edit")
+							.onClick(() => {
+								new GitlabRepoModal(this.app, {
+									title: `Edit ${entry.projectPath}`,
+									description:
+										"Change where this repo's files land in your vault. Leave blank to fall back to the global sync folder. Existing files at the old location are left alone \u2014 delete them manually if you want a clean move.",
+									buttonText: "Save & sync",
+									initialUrl: this.plugin.repoUrlFromEntry(entry),
+									lockUrl: true,
+									includeDestination: true,
+									initialDestination: entry.destinationFolder ?? "",
+									onSubmit: async ({ url, destinationFolder }) => {
+										await this.plugin.syncRepoMarkdown(url, {
+											destinationFolder,
+										});
+										this.display();
+									},
+								}).open();
 							}),
 					)
 					.addButton((btn) =>
