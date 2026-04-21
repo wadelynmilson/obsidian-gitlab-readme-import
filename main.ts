@@ -364,7 +364,7 @@ export default class GitlabReadmeImportPlugin extends Plugin {
 			}
 			progress.hide();
 			const suffix = failed > 0 ? ` (${failed} failed \u2014 see console)` : "";
-			new Notice(`Synced ${written} file(s) to ${targetRoot}/${suffix}`);
+			new Notice(`Synced ${written} file(s) to ${targetRoot}${suffix}`);
 		} catch (error) {
 			console.error("GitLab markdown sync failed", error);
 			const message = error instanceof Error ? error.message : String(error);
